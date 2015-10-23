@@ -1,0 +1,155 @@
+###
+# This is a Jenkins Job builder template for creating jenkins jobs.
+# It is not a Jenkins plugin. It is a CLI tool that parses a yaml file
+# and uploads job XML to a jenkins server. It allows jenkins jobs to be
+# developed outside of the Jenkins web UI and kept under version control.
+# Documentation: http://docs.openstack.org/infra/jenkins-job-builder/
+#
+# 1. Place a copy of this file and the config directory to your source repository
+# 2. Edit the global parameters and config/jenkins-jobs.ini file
+# 3. Run jenkins-jobs CLI to upload XML to your jenkins master
+#    jenkins-jobs --conf config/jenkins-jobs.ini --ignore-cache update jenkins-jobs.yaml
+# 4. Once you're satisfied, commit changes to source control.
+###
+
+# project bootstrap command:
+# oc new-app https://github.com/openshift/mongodb.git \
+#    --context-dir 2.6 \
+#    -e MONGODB_USER=mongo,MONGODB_PASSWORD=mongopass,MONGODB_DATABASE=mongodb,MONGODB_ADMIN_PASSWORD=adminpass
+
+###
+# Edit these values for your project.
+###
+- defaults:
+    name: global
+    node: master
+    mail-to: aweiteka@redhat.com
+    description: >
+        A jenkins-jobs template to create jobs in Jenkins.
+        Do not edit this job through the web user interface.
+    ose-uri: https://console.engint.openshift.com
+    ose-insecure: true
+    ose-project-namespace: build-demo
+    ose-token: eyJ...Nug
+    ose-token-file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    ose-image-name: mongodb
+    upstream-image-name: centos
+    upstream-image-tag: centos7
+    oc-cmd: oc -n {ose-project-namespace} --token=`cat {ose-token-file}` --insecure-skip-tls-verify={ose-insecure} --server={ose-uri}
+# If you have more than once source repository copy the scm section
+# edit and use the name value to use it in your job
+- scm:
+    name: dockerfile
+    scm:
+      - git:
+          url: 'https://github.com/openshift/mongodb.git'
+          branches:
+           - origin/jenkins
+          skip-tag: true
+
+###
+# End edit values
+###
+
+- project:
+   name: automated-builds
+   jobs:
+    # update this list if you add or remove a job-template
+    - 'build-image'
+    - 'functional-test'
+    - 'tag-image'
+    - 'refresh-imagestreams'
+
+- job-template:
+    name: 'functional-test'
+    description: Run functional tests
+    properties:
+      - delivery-pipeline:
+          stage: stage
+    scm:
+      - dockerfile
+    builders:
+      - openshift-dep-verify:
+          dep-cfg: '{ose-image-name}'
+          replica-count: 1
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+      - openshift-svc-verify:
+          svc-name: '{ose-image-name}'
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+      # TODO: run real test suite on remote service endpoint
+      - shell: |
+          IP=$({oc-cmd} get service {ose-image-name} -o template -t {{{{.spec.portalIP}}}})
+          PORT=$({oc-cmd} get service {ose-image-name} -o template -t '{{{{$port := index $.spec.ports 0}}}}{{{{$port.targetPort}}}}')
+          curl $IP:$PORT
+    publishers:
+    - archive:
+        artifacts: '**/**'
+        allow-empty: 'true'
+
+###
+# Service jobs
+# You typically will not need to edit anything below
+###
+
+- job-template:
+    name: 'refresh-imagestreams'
+    description: Update OpenShift imagestreams to detect upstream image changes
+    scm:
+      - openshift-img-streams:
+          image-stream-name: '{upstream-image-name}'
+          tag: '{upstream-image-tag}'
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+    triggers:
+      - timed: '@hourly'
+
+- job-template:
+    name: 'build-image'
+    description: Starts a build in OpenShift
+    properties:
+      - delivery-pipeline:
+          stage: build
+    scm:
+      - dockerfile
+      - openshift-img-streams:
+          image-stream-name: '{upstream-image-name}'
+          tag: '{upstream-image-tag}'
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+    triggers:
+      - timed: '@hourly'
+    builders:
+      - openshift-builder:
+          bld-cfg: '{ose-image-name}'
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+          follow-log: true
+    publishers:
+      - trigger-parameterized-builds:
+          - project: 'functional-test'
+            trigger-with-no-params: true
+            condition: 'UNSTABLE_OR_BETTER'
+
+- job-template:
+    name: 'tag-image'
+    description: "Tag image"
+    parameters:
+      - string:
+          name: TAG
+          description: "Image tag, e.g. my/image:TAG"
+    builders:
+      - openshift-img-tagger:
+          test-tag: '{ose-image-name}:latest'
+          # TODO: TAG is not interpolated
+          prod-tag: '{ose-image-name}:$TAG'
+          api-url: '{ose-uri}'
+          namespace: '{ose-project-namespace}'
+          auth-token: '{ose-token}'
+
